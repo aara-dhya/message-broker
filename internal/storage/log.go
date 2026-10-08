@@ -5,83 +5,134 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 )
 
-type BatchLog struct {
-	mu     sync.Mutex
-	file   *os.File
-	closed chan struct{}
+const IndexEntrySize = 16 // 8 bytes (ID) + 8 bytes (Offset)
+
+type IndexedLog struct {
+	mu            sync.RWMutex // Upgraded to RWMutex for concurrent reads
+	dataFile      *os.File
+	indexFile     *os.File
+	nextID        uint64
+	currentOffset uint64
 }
 
-func NewBatchLog(path string, syncInterval time.Duration) (*BatchLog, error) {
-	// 1. Notice: NO os.O_SYNC here!
-	// Writes hit the lightning-fast OS Page Cache directly.
-	f, err := os.OpenFile(
-		path,
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
+// NewIndexedLog opens or creates both the data log and its sidecar index.
+func NewIndexedLog(basePath string) (*IndexedLog, error) {
+	dataFile, err := os.OpenFile(basePath+".log", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
+		return nil, fmt.Errorf("failed to open data file: %w", err)
 	}
 
-	bl := &BatchLog{
-		file:   f,
-		closed: make(chan struct{}),
+	indexFile, err := os.OpenFile(basePath+".idx", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		dataFile.Close()
+		return nil, fmt.Errorf("failed to open index file: %w", err)
 	}
 
-	// 2. Background worker: Flush dirty page cache pages to disk in batches
-	go bl.backgroundFlusher(syncInterval)
+	dataInfo, err := dataFile.Stat()
+	if err != nil {
+		return nil, err
+	}
+	indexInfo, err := indexFile.Stat()
+	if err != nil {
+		return nil, err
+	}
 
-	return bl, nil
+	return &IndexedLog{
+		dataFile:      dataFile,
+		indexFile:     indexFile,
+		currentOffset: uint64(dataInfo.Size()),
+		nextID:        uint64(indexInfo.Size() / IndexEntrySize),
+	}, nil
 }
 
-// Append writes the frame in a single Write syscall to the OS Page Cache.
-func (bl *BatchLog) Append(payload []byte) error {
+// Append writes the entry using stateless WriteAt to avoid Seek race conditions.
+func (l *IndexedLog) Append(payload []byte) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	id := l.nextID
+	offset := l.currentOffset
 	payloadLen := len(payload)
+
+	// 1. Prepare 16-byte index entry
+	var indexBuf [IndexEntrySize]byte
+	binary.BigEndian.PutUint64(indexBuf[0:8], id)
+	binary.BigEndian.PutUint64(indexBuf[8:16], offset)
+
+	// Write index statelessly
+	indexOffset := int64(id * IndexEntrySize)
+	if _, err := l.indexFile.WriteAt(indexBuf[:], indexOffset); err != nil {
+		return 0, fmt.Errorf("failed to write index entry: %w", err)
+	}
+
+	// 2. Prepare single buffer for data frame [Header + Payload]
 	frameSize := 8 + payloadLen
+	frameBuf := make([]byte, frameSize)
+	binary.BigEndian.PutUint64(frameBuf[0:8], uint64(payloadLen))
+	copy(frameBuf[8:], payload)
 
-	// Combine header + payload into a SINGLE slice to avoid 2 write syscalls.
-	// For production, use a sync.Pool buffer to make this zero-allocation!
-	buf := make([]byte, frameSize)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(payloadLen))
-	copy(buf[8:], payload)
-
-	bl.mu.Lock()
-	defer bl.mu.Unlock()
-
-	// Single syscall into Linux Page Cache (Takes nanoseconds!)
-	if _, err := bl.file.Write(buf); err != nil {
-		return fmt.Errorf("page cache write failed: %w", err)
+	// 3. Write data statelessly in a single syscall
+	if _, err := l.dataFile.WriteAt(frameBuf, int64(offset)); err != nil {
+		return 0, fmt.Errorf("failed to write data frame: %w", err)
 	}
 
-	return nil
+	// 4. Update internal positions for the next append
+	l.nextID++
+	l.currentOffset += uint64(frameSize)
+
+	return id, nil
 }
 
-func (bl *BatchLog) backgroundFlusher(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// DO NOT lock the mutex here.
-			// Let the OS handle the file descriptor synchronization safely in the background.
-			_ = bl.file.Sync()
-		case <-bl.closed:
-			return
-		}
+// Read uses ReadAt to fetch data statelessly, allowing infinite concurrent consumers.
+func (l *IndexedLog) Read(id uint64) ([]byte, error) {
+	// --- Step 1: Concurrency Check ---
+	l.mu.RLock()
+	if id >= l.nextID {
+		l.mu.RUnlock()
+		return nil, fmt.Errorf("message id %d does not exist", id)
 	}
+	l.mu.RUnlock() // Drop the lock immediately! Disk I/O below is completely concurrent.
+
+	// --- Step 2: Query the Index File ---
+	indexOffset := int64(id * IndexEntrySize)
+	var indexBuf [IndexEntrySize]byte
+	if _, err := l.indexFile.ReadAt(indexBuf[:], indexOffset); err != nil {
+		return nil, fmt.Errorf("failed to read index entry for ID %d: %w", id, err)
+	}
+
+	storedID := binary.BigEndian.Uint64(indexBuf[0:8])
+	targetByteOffset := binary.BigEndian.Uint64(indexBuf[8:16])
+
+	if storedID != id {
+		return nil, fmt.Errorf("index corruption: expected ID %d, found %d", id, storedID)
+	}
+
+	// --- Step 3: Jump directly into the Data Log ---
+	var headerBuf [8]byte
+	if _, err := l.dataFile.ReadAt(headerBuf[:], int64(targetByteOffset)); err != nil {
+		return nil, fmt.Errorf("failed to read payload size header: %w", err)
+	}
+
+	payloadLen := binary.BigEndian.Uint64(headerBuf[:])
+	payload := make([]byte, payloadLen)
+
+	// Read payload by shifting the offset past the 8-byte header
+	payloadOffset := int64(targetByteOffset) + 8
+	if _, err := l.dataFile.ReadAt(payload, payloadOffset); err != nil {
+		return nil, fmt.Errorf("failed to read payload bytes: %w", err)
+	}
+
+	return payload, nil
 }
 
-func (bl *BatchLog) Close() error {
-	close(bl.closed)
+func (l *IndexedLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-	bl.mu.Lock()
-	defer bl.mu.Unlock()
-
-	// Guarantee every remaining byte is physically on disk before shutting down
-	_ = bl.file.Sync()
-	return bl.file.Close()
+	if err := l.indexFile.Close(); err != nil {
+		return err
+	}
+	return l.dataFile.Close()
 }
